@@ -1,0 +1,9 @@
+[workspace]
+default-members = [
+    "axum-login-bearer",
+]
+resolver = "2"
+members = [
+    "axum-login-bearer",
+    # "examples/*",
+]
