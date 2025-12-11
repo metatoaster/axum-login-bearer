@@ -5,5 +5,5 @@ default-members = [
 resolver = "2"
 members = [
     "axum-login-bearer",
-    # "examples/*",
+    "examples/*",
 ]
