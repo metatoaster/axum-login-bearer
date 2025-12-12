@@ -7,7 +7,7 @@ use std::{
 
 use reqwest::{
     cookie::{CookieStore, Jar},
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, SET_COOKIE, HeaderMap, HeaderValue},
     Client, StatusCode, Url,
 };
 use serial_test::serial;
@@ -54,7 +54,7 @@ async fn sqlite_bearer_example() {
     assert_eq!(*res.url(), url("/"));
     assert_eq!(res.status(), StatusCode::OK);
 
-    // extract the session id from the cookie set after the successful login
+    // Extract the cookie from the successful login as if it's the session id
     let cookies = cookie_jar
         .cookies(&url("/"))
         .expect("A cookie should be set");
@@ -63,17 +63,30 @@ async fn sqlite_bearer_example() {
         .split_once('=')
         .expect("token should have been provided as a cookie");
 
-    let mut bearer_token = HeaderValue::from_str(&format!("Bearer {session_id}")).unwrap();
-    bearer_token.set_sensitive(true);
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, bearer_token);
-    let bearer_client = Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap();
+    // Attempt to use that cookie set after the successful login as the bearer token
+    let bearer_client = client_with_bearer_token(&session_id);
+
+    // Unfortunately, it will not work as the cookie is encrypted using a different scheme.
+    let res = bearer_client.get(url("/")).send().await.unwrap();
+    assert_eq!(*res.url(), url("/login?next=%2F"));
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let simple_client = Client::new();
+    // Instead, use the dedicated endpoint that provide the bearer token.  First validate the
+    // endpoint works (but with invalid credentials for first try, then valid ones after)
+    let res = get_bearer_token(&simple_client, "ferris", "bogus").await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(!res.headers().contains_key(SET_COOKIE));
+
+    // Now with a proper bearer token, it should work.
+    let res = get_bearer_token(&simple_client, "ferris", "hunter42").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(!res.headers().contains_key(SET_COOKIE));
+    let bearer_client = client_with_bearer_token(&res.text().await.unwrap());
     let res = bearer_client.get(url("/")).send().await.unwrap();
     assert_eq!(*res.url(), url("/"));
     assert_eq!(res.status(), StatusCode::OK);
+    // TODO naturally should configure the bearer token issuer with some encryption scheme
 
     // Log out and check the cookie has been removed in response.
     let res = client.get(url("/logout")).send().await.unwrap();
@@ -84,7 +97,9 @@ async fn sqlite_bearer_example() {
         "Expected 'id' cookie to be removed"
     );
 
-    // The bearer token should also be invalidated by this point
+    // The bearer token should also be invalidated if it use the logout endpoint.
+    let res = bearer_client.get(url("/logout")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
     let res = bearer_client.get(url("/")).send().await.unwrap();
     assert_eq!(*res.url(), url("/login?next=%2F"));
     assert_eq!(res.status(), StatusCode::OK);
@@ -143,4 +158,22 @@ async fn login(client: &Client, username: &str, password: &str) -> reqwest::Resp
     form.insert("username", username);
     form.insert("password", password);
     client.post(url("/login")).form(&form).send().await.unwrap()
+}
+
+fn client_with_bearer_token(bearer_token: &str) -> Client {
+    let mut bearer_token = HeaderValue::from_str(&format!("Bearer {bearer_token}")).unwrap();
+    bearer_token.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, bearer_token);
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
+async fn get_bearer_token(client: &Client, username: &str, password: &str) -> reqwest::Response {
+    let mut form = HashMap::new();
+    form.insert("username", username);
+    form.insert("password", password);
+    client.post(url("/api/bearer")).form(&form).send().await.unwrap()
 }

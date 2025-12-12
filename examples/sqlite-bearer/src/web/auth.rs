@@ -8,6 +8,7 @@ use axum::{
 };
 use axum_messages::{Message, Messages};
 use serde::Deserialize;
+use tower_sessions::Session;
 
 use crate::users::{AuthSession, Credentials};
 
@@ -28,6 +29,7 @@ pub struct NextUrl {
 pub fn router() -> Router<()> {
     Router::new()
         .route("/login", post(self::post::login))
+        .route("/api/bearer", post(self::post::bearer))
         .route("/login", get(self::get::login))
         .route("/logout", get(self::get::logout))
 }
@@ -68,6 +70,31 @@ mod post {
         }
         .into_response()
     }
+
+    pub async fn bearer(
+        session: axum::Extension<Session>,
+        mut auth_session: AuthSession,
+        messages: Messages,
+        Form(creds): Form<Credentials>,
+    ) -> impl IntoResponse {
+        let user = match auth_session.authenticate(creds.clone()).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return StatusCode::FORBIDDEN.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        if auth_session.login(&user).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        messages.success(format!("Successfully logged in as {}", user.username));
+
+        if session.save().await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        session.id().unwrap().to_string().into_response()
+    }
+
 }
 
 mod get {

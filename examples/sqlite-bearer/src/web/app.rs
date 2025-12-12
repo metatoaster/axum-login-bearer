@@ -46,8 +46,8 @@ impl App {
 
         let session_layer = SessionManagerLayer::new(session_store.clone())
             .with_secure(false)
-            .with_expiry(Expiry::OnInactivity(Duration::days(1)));
-            // .with_signed(key);
+            .with_expiry(Expiry::OnInactivity(Duration::days(1)))
+            .with_signed(key);
 
         // Auth service.
         //
@@ -58,7 +58,7 @@ impl App {
         // which will mean bearer tokens issued will be usable via cookies.  Use a different store if this
         // is undesirable.
         let auth_layer = BearerTokenAuthManagerLayer::new(session_store, backend, session_layer)
-            .with_new_bearer_endpoint("/api/bearer/login");
+            .with_new_bearer_endpoint("/api/bearer");
 
         let app = protected::router()
             .route_layer(login_required!(Backend, login_url = "/login"))
