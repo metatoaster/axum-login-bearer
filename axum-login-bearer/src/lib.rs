@@ -38,7 +38,6 @@ pub struct BearerTokenAuthManagerLayer<
     config: BearerTokenAuthManagerConfig,
     session_manager_layer: SessionManagerLayer<Store, C>,
     backend: Backend,
-    data_key: Option<&'static str>,
 }
 
 impl<S, Store> BearerTokenAuthManager<S, Store>
@@ -152,7 +151,6 @@ impl<
             config,
             session_manager_layer,
             backend,
-            data_key: None,
         }
     }
 
@@ -187,7 +185,7 @@ for
         let login_manager = AuthManager::new(
             inner,
             self.backend.clone(),
-            self.data_key.unwrap_or("axum-login.data"),
+            self.config.data_key.unwrap_or("axum-login.data"),
         );
         let bearer_manager = BearerTokenAuthManager {
             inner: login_manager,
