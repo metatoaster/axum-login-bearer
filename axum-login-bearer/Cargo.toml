@@ -18,9 +18,11 @@ readme = "README.md"
 [dependencies]
 axum = "0.8.0"
 axum-login = "0.18.0"
+aes-gcm = { version = "0.10.0", optional = true }
 base64 = { version = "0.22", optional = true }
 cookie = { version = "0.18", optional = true }
 hmac = { version = "0.12.0", optional = true }
+rand = { version = "0.8", optional = true }
 sha2 = { version = "0.10.0", optional = true }
 tower-cookies = "0.11.0"
 tower-layer = "0.3.2"
@@ -42,4 +44,8 @@ signed = [
     "sha2",
     "cookie/signed",
 ]
-private = ["cookie/secure"]
+private = [
+    "aes-gcm",
+    "cookie/secure",
+    "rand",
+]

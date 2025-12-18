@@ -17,6 +17,8 @@ use tower_sessions::{
 };
 
 mod codec;
+#[cfg(feature = "private")]
+mod private;
 #[cfg(feature = "signed")]
 mod signed;
 
@@ -245,7 +247,11 @@ impl<
 
     #[cfg(feature = "private")]
     pub fn with_private(mut self, key: Key) -> Self {
-        self.config.token_mode = TokenMode::Private(key);
+        // using "id" as that's the default for the cookie.
+        // shouldn't matter if the key is different to the one that's ultimately assigned to the cookie
+        // jar, but this leaves open the possibility of swapping the cookie's value into a bearer token,
+        // which should normally not be a desirable thing.
+        self.config.token_mode = TokenMode::Custom(Arc::new(private::Private::new("id", key)));
         self
     }
 }
