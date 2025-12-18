@@ -6,6 +6,8 @@ use std::{
 use axum::http::{header, Request, Response};
 use axum_login::{AuthManager, AuthnBackend};
 use tower_cookies::CookieManager;
+#[cfg(any(feature = "signed", feature = "private"))]
+use tower_cookies::Key;
 use tower_layer::Layer;
 use tower_service::Service;
 use tower_sessions::{
@@ -14,11 +16,31 @@ use tower_sessions::{
     Expiry, Session, SessionStore, SessionManager, SessionManagerLayer,
 };
 
+#[cfg(feature = "signed")]
+mod signed;
+
+#[derive(Clone, Debug, Default)]
+enum TokenMode {
+    #[default]
+    Default,
+    #[cfg(feature = "signed")]
+    Signed(Key),
+    #[cfg(feature = "private")]
+    Private(Key),
+}
+
 #[derive(Clone, Debug, Default)]
 struct BearerTokenAuthManagerConfig {
     expiry: Option<Expiry>,
     data_key: Option<&'static str>,
     new_bearer_endpoint: Option<&'static str>,
+    token_mode: TokenMode,
+}
+
+#[derive(Clone, Debug)]
+pub struct BearerAuthSession {
+    session: Session,
+    token_mode: TokenMode,
 }
 
 #[derive(Clone)]
@@ -38,6 +60,60 @@ pub struct BearerTokenAuthManagerLayer<
     config: BearerTokenAuthManagerConfig,
     session_manager_layer: SessionManagerLayer<Store, C>,
     backend: Backend,
+}
+
+impl TokenMode {
+    fn encode_id(&self, id: &Id) -> String {
+        let serialized = id.to_string();
+        match self {
+            Self::Default => {
+                serialized
+            }
+            #[cfg(feature = "signed")]
+            Self::Signed(key) => {
+                Self::encode_signed(key, &serialized)
+            }
+            #[cfg(feature = "private")]
+            Self::Private(key) => {
+                todo!();
+            }
+        }
+    }
+
+    fn decode_id(&self, s: &str) -> Result<Id, &'static str> {
+        fn deserialize(s: &str) -> Result<Id, &'static str> {
+            s.parse::<Id>()
+                .map_err(|_| "cannot decode to id")
+        }
+
+        match self {
+            Self::Default => {
+                deserialize(s)
+            }
+            #[cfg(feature = "signed")]
+            Self::Signed(key) => {
+                let decoded = Self::decode_signed(key, s)?;
+                deserialize(&decoded)
+            }
+            #[cfg(feature = "private")]
+            Self::Private(key) => {
+                todo!();
+            }
+        }
+    }
+}
+
+impl BearerAuthSession {
+    fn new(session: Session, token_mode: TokenMode) -> Self {
+        BearerAuthSession { session, token_mode }
+    }
+
+    /// Encode the underlying session into a bearer token that may be sent to the client.
+    pub fn encode_token(&self) -> Option<String> {
+        self.session.id()
+            .as_ref()
+            .map(|id| self.token_mode.encode_id(id))
+    }
 }
 
 impl<S, Store> BearerTokenAuthManager<S, Store>
@@ -108,7 +184,7 @@ where
                     if let Ok(authorization) = value.to_str() {
                         match authorization.split_once(' ') {
                             Some((name, token)) if name == "Bearer" => {
-                                if let Ok(session_id) = token.parse::<Id>() {
+                                if let Ok(session_id) = config.token_mode.decode_id(token) {
                                     // Only override the session when provided with a valid bearer token.
                                     let session = Session::new(Some(session_id), store, config.expiry);
                                     req.extensions_mut().insert(session);
@@ -124,8 +200,10 @@ where
                     // and not the one tracked by `SessionManager` - this way prevents it from triggering the
                     // cookie to be sent by the `CookieManager`.
                     if Some(req.uri().to_string().as_ref()) == config.new_bearer_endpoint {
-                        let session = Session::new(Some(Id::default()), store, config.expiry);
+                        let session = Session::new(None, store, config.expiry);
+                        let token = BearerAuthSession::new(session.clone(), config.token_mode);
                         req.extensions_mut().insert(session);
+                        req.extensions_mut().insert(token);
                     }
                 }
                 inner.call(req).await
@@ -166,6 +244,18 @@ impl<
 
     pub fn with_new_bearer_endpoint(mut self, new_bearer_endpoint: &'static str) -> Self {
         self.config.new_bearer_endpoint = Some(new_bearer_endpoint);
+        self
+    }
+
+    #[cfg(feature = "signed")]
+    pub fn with_signed(mut self, key: Key) -> Self {
+        self.config.token_mode = TokenMode::Signed(key);
+        self
+    }
+
+    #[cfg(feature = "private")]
+    pub fn with_private(mut self, key: Key) -> Self {
+        self.config.token_mode = TokenMode::Private(key);
         self
     }
 }

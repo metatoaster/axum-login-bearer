@@ -18,6 +18,10 @@ readme = "README.md"
 [dependencies]
 axum = "0.8.0"
 axum-login = "0.18.0"
+base64 = { version = "0.22", optional = true }
+cookie = { version = "0.18", optional = true }
+hmac = { version = "0.12.0", optional = true }
+sha2 = { version = "0.10.0", optional = true }
 tower-cookies = "0.11.0"
 tower-layer = "0.3.2"
 tower-service = "0.3.2"
@@ -30,3 +34,12 @@ serial_test = "3.0.0"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-test = "0.4.3"
 tower = "0.5.2"
+
+[features]
+signed = [
+    "base64",
+    "hmac",
+    "sha2",
+    "cookie/signed",
+]
+private = ["cookie/secure"]
