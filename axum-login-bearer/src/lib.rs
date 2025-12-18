@@ -5,6 +5,7 @@ use std::{
 };
 use axum::http::{header, Request, Response};
 use axum_login::{AuthManager, AuthnBackend};
+use tower::util::Either;
 use tower_cookies::CookieManager;
 #[cfg(any(feature = "signed", feature = "private"))]
 use tower_cookies::Key;
@@ -37,6 +38,7 @@ struct BearerTokenAuthManagerConfig {
     data_key: Option<&'static str>,
     new_bearer_endpoint: Option<&'static str>,
     token_mode: TokenMode,
+    has_session_manager_layer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +62,7 @@ pub struct BearerTokenAuthManagerLayer<
 > {
     store: Arc<Store>,
     config: BearerTokenAuthManagerConfig,
-    session_manager_layer: SessionManagerLayer<Store, C>,
+    session_manager_layer: Option<SessionManagerLayer<Store, C>>,
     backend: Backend,
 }
 
@@ -186,7 +188,12 @@ where
                     // inserted such that this would then be used and any update will be done to this copy
                     // and not the one tracked by `SessionManager` - this way prevents it from triggering the
                     // cookie to be sent by the `CookieManager`.
-                    if Some(req.uri().to_string().as_ref()) == config.new_bearer_endpoint {
+                    //
+                    // The other way this (current) will provide a new session is if there is no underlying
+                    // session manager layer, which makes this being the one layer that should provide it.
+                    if Some(req.uri().to_string().as_ref()) == config.new_bearer_endpoint ||
+                        !config.has_session_manager_layer
+                    {
                         let session = Session::new(None, store, config.expiry);
                         let token = BearerAuthSession::new(session.clone(), config.token_mode);
                         req.extensions_mut().insert(session);
@@ -207,14 +214,13 @@ impl<
     pub fn new(
         store: Store,
         backend: Backend,
-        session_manager_layer: SessionManagerLayer<Store, C>,
     ) -> Self {
         let config = BearerTokenAuthManagerConfig::default();
 
         Self {
             store: Arc::new(store),
             config,
-            session_manager_layer,
+            session_manager_layer: None,
             backend,
         }
     }
@@ -231,6 +237,14 @@ impl<
 
     pub fn with_new_bearer_endpoint(mut self, new_bearer_endpoint: &'static str) -> Self {
         self.config.new_bearer_endpoint = Some(new_bearer_endpoint);
+        self
+    }
+
+    /// Configure this `BearerTokenManagerLayer` with a `SessionManagerLayer` to enable
+    /// fallback with cookie-based sessions when Bearer tokens are not available.
+    pub fn with_session_manager_layer(mut self, session_manager_layer: SessionManagerLayer<Store, C>) -> Self {
+        self.config.has_session_manager_layer = true;
+        self.session_manager_layer = Some(session_manager_layer);
         self
     }
 
@@ -265,21 +279,40 @@ impl<
 for
     BearerTokenAuthManagerLayer<Store, C, Backend>
 {
-    type Service = CookieManager<SessionManager<BearerTokenAuthManager<AuthManager<S, Backend>, Store>, Store, C>>;
+    type Service = Either<
+        BearerTokenAuthManager<AuthManager<S, Backend>, Store>,
+        // BearerTokenAuthManager<CookieManager<SessionManager<AuthManager<S, Backend>, Store, C>>, Store>,
+        CookieManager<SessionManager<BearerTokenAuthManager<AuthManager<S, Backend>, Store>, Store, C>>,
+    >;
 
     fn layer(&self, inner: S) -> Self::Service {
-        let login_manager = AuthManager::new(
+        let auth_manager = AuthManager::new(
             inner,
             self.backend.clone(),
             self.config.data_key.unwrap_or("axum-login.data"),
         );
-        let bearer_manager = BearerTokenAuthManager {
-            inner: login_manager,
-            store: self.store.clone(),
-            config: self.config.clone(),
-        };
-
-        self.session_manager_layer
-            .layer(bearer_manager)
+        match &self.session_manager_layer {
+            Some(session_manager_layer) => {
+                // Either::Right(BearerTokenAuthManager {
+                //     inner: session_manager_layer.layer(auth_manager),
+                //     store: self.store.clone(),
+                //     config: self.config.clone(),
+                // })
+                Either::Right(session_manager_layer.layer(
+                    BearerTokenAuthManager {
+                        inner: auth_manager,
+                        store: self.store.clone(),
+                        config: self.config.clone(),
+                    }
+                ))
+            }
+            None => {
+                Either::Left(BearerTokenAuthManager {
+                    inner: auth_manager,
+                    store: self.store.clone(),
+                    config: self.config.clone(),
+                })
+            }
+        }
     }
 }

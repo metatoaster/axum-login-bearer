@@ -57,7 +57,8 @@ impl App {
         // In this configuration we use the same session store as the one provided to `SessionManagerLayer`
         // which will mean bearer tokens issued will be usable via cookies.  Use a different store if this
         // is undesirable.
-        let auth_layer = BearerTokenAuthManagerLayer::new(session_store, backend, session_layer)
+        let auth_layer = BearerTokenAuthManagerLayer::new(session_store, backend)
+            .with_session_manager_layer(session_layer)
             .with_new_bearer_endpoint("/api/bearer")
             // Sign the bearer token with a different key to differentiate it from a session cookie.
             .with_signed(Key::generate());
