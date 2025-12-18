@@ -16,17 +16,17 @@ use tower_sessions::{
     Expiry, Session, SessionStore, SessionManager, SessionManagerLayer,
 };
 
+mod codec;
 #[cfg(feature = "signed")]
 mod signed;
+
+pub use codec::{BearerTokenIdCodec, BearerTokenStrCodec};
 
 #[derive(Clone, Debug, Default)]
 enum TokenMode {
     #[default]
     Default,
-    #[cfg(feature = "signed")]
-    Signed(Key),
-    #[cfg(feature = "private")]
-    Private(Key),
+    Custom(Arc<dyn BearerTokenIdCodec + Send + Sync + 'static>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -64,40 +64,25 @@ pub struct BearerTokenAuthManagerLayer<
 
 impl TokenMode {
     fn encode_id(&self, id: &Id) -> String {
-        let serialized = id.to_string();
         match self {
             Self::Default => {
-                serialized
+                id.to_string()
             }
-            #[cfg(feature = "signed")]
-            Self::Signed(key) => {
-                Self::encode_signed(key, &serialized)
-            }
-            #[cfg(feature = "private")]
-            Self::Private(key) => {
-                todo!();
+            Self::Custom(codec) => {
+                codec.encode_id(id)
             }
         }
     }
 
     fn decode_id(&self, s: &str) -> Result<Id, &'static str> {
-        fn deserialize(s: &str) -> Result<Id, &'static str> {
-            s.parse::<Id>()
-                .map_err(|_| "cannot decode to id")
-        }
-
         match self {
             Self::Default => {
-                deserialize(s)
+                s.parse::<Id>()
+                    .map_err(|_| "cannot decode to id")
             }
-            #[cfg(feature = "signed")]
-            Self::Signed(key) => {
-                let decoded = Self::decode_signed(key, s)?;
-                deserialize(&decoded)
-            }
-            #[cfg(feature = "private")]
-            Self::Private(key) => {
-                todo!();
+            Self::Custom(codec) => {
+                codec.decode_id(s)
+                    .ok_or("failed to decode to id")
             }
         }
     }
@@ -247,9 +232,14 @@ impl<
         self
     }
 
+    pub fn with_token_id_codec(mut self, codec: impl BearerTokenIdCodec + Send + Sync + 'static) -> Self {
+        self.config.token_mode = TokenMode::Custom(Arc::new(codec));
+        self
+    }
+
     #[cfg(feature = "signed")]
     pub fn with_signed(mut self, key: Key) -> Self {
-        self.config.token_mode = TokenMode::Signed(key);
+        self.config.token_mode = TokenMode::Custom(Arc::new(signed::Signed(key)));
         self
     }
 
