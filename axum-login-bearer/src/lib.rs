@@ -92,6 +92,12 @@ impl TokenMode {
     }
 }
 
+impl BearerTokenAuthManagerConfig {
+    fn is_bearer_endpoint(&self, uri: &str) -> bool {
+        Some(uri) == self.new_bearer_endpoint
+    }
+}
+
 impl BearerAuthSession {
     fn new(session: Session, token_mode: TokenMode) -> Self {
         BearerAuthSession { session, token_mode }
@@ -117,6 +123,7 @@ where
         }
     }
 }
+
 impl<ReqBody, ResBody, S, Store: SessionStore> Service<Request<ReqBody>> for BearerTokenAuthManager<S, Store>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -134,8 +141,19 @@ where
     }
 
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        let store = self.store.clone();
-        let config = self.config.clone();
+        // Check if this value was already provided or extract it
+        let bearer_token_id = req.extensions_mut()
+            // be explicit here with types to prevent the next line from potentially forgetting to do the
+            // `.unwrap_or`...
+            .remove::<BearerTokenId>()
+            .unwrap_or_else(|| extract_bearer_token(&req, &self.config).unwrap_or(BearerTokenId(None)));
+
+        // must provide the token to extensions as there may be no other layers below this.
+        let id = bearer_token_id.0;
+        let session = Session::new(id, self.store.clone(), self.config.clone().expiry);
+        let token = BearerAuthSession::new(session.clone(), self.config.token_mode.clone());
+        req.extensions_mut().insert(session);
+        req.extensions_mut().insert(token);
 
         // Because the inner service can panic until ready, we need to ensure we only
         // use the ready service.
@@ -144,62 +162,8 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // The following is a very naive implementation of a bearer token service provider that is coupled to
-        // the layer setup below, which effectively slips this service layer below axum-login's `AuthManager`
-        // and above the `SessionManager` that `AuthManager` typically is stacked directly on top of.  
-        //
-        // Normally when a request comes in, the session layer will use the cookie provided by the underlying
-        // `CookieManager` to back a `Session`, where it in turn be used by the `AuthManager`to set up an
-        // `AuthSession`, which the user-provided login logic will leverage.  Once the request is handled and
-        // passed back down to the `SessionManager`, if the session layer sees the new data being set (e.g. a
-        // new login being assigned to the session), it will result in the cookie being updated, and then the
-        // cookie layer will ensure a `Set-Cookie` header is sent.  This final step can be undesirable if we
-        // only want bearer tokens be used when provided as we may not want a cookie to be set or sent.  This
-        // naive implementation hijacks this normal control flow to prevent this, though a better/proper
-        // implementation can probably be done using tower's `Either` and `Steer`.
-        //
-        // In any case, the two places where the hijacking happens are explained below.  The hijacking works
-        // simply because the `SessionManager` keeps a copy of the `Session` it has added, and if that isn't
-        // modified it won't inform of the changes down to the `CookieManager`.  The modification is prevented
-        // by inserting a new `Session` into the extensions, which kicks the previous one out.
         Box::pin(
             async move {
-                let value = req.headers()
-                    .get(header::AUTHORIZATION);
-                if let Some(value) = value {
-                    // First condition where the `Session` should be hijacked: if the bearer token is provided
-                    // with the request, set up a new `Session` with that id and insert that, which then the
-                    // `AuthManager` will use to set up an `AuthSession` with.
-                    if let Ok(authorization) = value.to_str() {
-                        match authorization.split_once(' ') {
-                            Some((name, token)) if name == "Bearer" => {
-                                if let Ok(session_id) = config.token_mode.decode_id(token) {
-                                    // Only override the session when provided with a valid bearer token.
-                                    let session = Session::new(Some(session_id), store, config.expiry);
-                                    req.extensions_mut().insert(session);
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-                } else {
-                    // The second condition is when a request is made to the endpoint where a bearer token
-                    // may be issued (TODO: this could be a set of endpoints), a new `Session` must be
-                    // inserted such that this would then be used and any update will be done to this copy
-                    // and not the one tracked by `SessionManager` - this way prevents it from triggering the
-                    // cookie to be sent by the `CookieManager`.
-                    //
-                    // The other way this (current) will provide a new session is if there is no underlying
-                    // session manager layer, which makes this being the one layer that should provide it.
-                    if Some(req.uri().to_string().as_ref()) == config.new_bearer_endpoint ||
-                        !config.has_session_manager_layer
-                    {
-                        let session = Session::new(None, store, config.expiry);
-                        let token = BearerAuthSession::new(session.clone(), config.token_mode);
-                        req.extensions_mut().insert(session);
-                        req.extensions_mut().insert(token);
-                    }
-                }
                 inner.call(req).await
             }
         )
@@ -271,18 +235,17 @@ impl<
 }
 
 impl<
-    S,
     Store: SessionStore,
     C: CookieController,
     Backend: AuthnBackend,
+    S: Clone,
 > Layer<S>
 for
     BearerTokenAuthManagerLayer<Store, C, Backend>
 {
     type Service = Either<
         BearerTokenAuthManager<AuthManager<S, Backend>, Store>,
-        // BearerTokenAuthManager<CookieManager<SessionManager<AuthManager<S, Backend>, Store, C>>, Store>,
-        CookieManager<SessionManager<BearerTokenAuthManager<AuthManager<S, Backend>, Store>, Store, C>>,
+        AuthPicker<S, Backend, Store, C>,
     >;
 
     fn layer(&self, inner: S) -> Self::Service {
@@ -291,20 +254,17 @@ for
             self.backend.clone(),
             self.config.data_key.unwrap_or("axum-login.data"),
         );
+
         match &self.session_manager_layer {
             Some(session_manager_layer) => {
-                // Either::Right(BearerTokenAuthManager {
-                //     inner: session_manager_layer.layer(auth_manager),
-                //     store: self.store.clone(),
-                //     config: self.config.clone(),
-                // })
-                Either::Right(session_manager_layer.layer(
-                    BearerTokenAuthManager {
-                        inner: auth_manager,
-                        store: self.store.clone(),
-                        config: self.config.clone(),
-                    }
-                ))
+                let bearer = BearerTokenAuthManager {
+                    inner: auth_manager.clone(),
+                    store: self.store.clone(),
+                    config: self.config.clone(),
+                };
+                let cookie = session_manager_layer.layer(auth_manager);
+
+                Either::Right(AuthPicker { bearer, cookie })
             }
             None => {
                 Either::Left(BearerTokenAuthManager {
@@ -313,6 +273,128 @@ for
                     config: self.config.clone(),
                 })
             }
+        }
+    }
+}
+
+// Internal use to pass token ids between layers where applicable.
+#[derive(Clone, Debug)]
+struct BearerTokenId(Option<Id>);
+
+// Selecting different layers is normally the ideal use case for `Steer, but unfortunately it does not work
+// in our case here due to type bounds being specified with a `Request` due to the `Picker` showing up as
+// part of the type signature, which renders it being incompatible when being applied to a `Router`.  For
+// example, this was tried:
+//
+// ```
+// impl<Store: SessionStore, C: CookieController, Backend: AuthnBackend, S: Clone> Layer<S>
+// for
+//     BearerTokenAuthManagerLayer<Store, C, Backend>
+// {
+//     type Service = Either<
+//         BearerTokenAuthManager<AuthManager<S, Backend>, Store>,
+//         Steer<S, fn(&Request<ReqBody>, &[S]) -> usize, Request<ReqBody>>,
+//     >;
+//
+//     fn layer(&self, inner: S) -> Self::Service {
+//         fn pick<S, ReqBody>(req: &Request<ReqBody>, _services: &[S]) -> usize {
+//             ...
+// ```
+//
+// While there weren't any issues with compiling, but upon usage with a `Router`:
+//
+// error[E0277]: `dyn HttpBody<Data = Bytes, Error = Error> + Send` cannot be shared between threads safely
+//    --> examples/sqlite-bearer/src/web/app.rs:71:20
+//     |
+// 71  |             .layer(auth_layer);
+//     |              ----- ^^^^^^^^^^ `dyn HttpBody<Data = Bytes, Error = Error> + Send` cannot be shared between threads safely
+//
+// That's due to the need to have the underlying Request type exposed at the layer level, even though that
+// normally doesn't come into play until later.
+//
+// Perhaps there may be another way around this but the author was unable to try it, but instead opted for
+// a custom struct with only the immediately neede things laid out given the relative simplicity of only
+// having two stacks to pick from.
+
+/// This provides a service that discriminates between auth sessions tracked by cookie backed and bearer token
+/// backed sessions.
+#[derive(Clone)]
+pub struct AuthPicker<S, Backend: AuthnBackend, Store: SessionStore, C: CookieController> {
+    bearer: BearerTokenAuthManager<AuthManager<S, Backend>, Store>,
+    cookie: CookieManager<SessionManager<AuthManager<S, Backend>, Store, C>>,
+}
+
+fn extract_bearer_token<ReqBody>(
+    req: &Request<ReqBody>,
+    config: &BearerTokenAuthManagerConfig,
+) -> Option<BearerTokenId> {
+    let value = req.headers()
+        .get(header::AUTHORIZATION);
+    if let Some(value) = value {
+        // When an authorization with `Bearer` is provided, assume the bearer workflow.
+        if let Ok(authorization) = value.to_str() {
+            if let Some((name, token)) = authorization.split_once(' ') && name == "Bearer" {
+                return Some(BearerTokenId(config.token_mode.decode_id(token).ok()));
+            }
+        }
+    } else {
+        // Alternatively, if the request uri points to a bearer endpoint as per the configuration, mark it as
+        // such by returning some `BearerTokenId` with a `None`.  This configuration is provided as such to
+        // help the picker disambiguate between whether to go down ehter the `BearerTokenAuth` or the
+        // `CookieManager` path as required.  This avoids placing the onus of having to provide some empty
+        // `Bearer` prefixed authorization on the user, as otherwise the cookie stack may be activated
+        // instead.
+        if config.is_bearer_endpoint(req.uri().to_string().as_ref()) {
+            return Some(BearerTokenId(None));
+        }
+    }
+    None
+}
+
+impl<
+    ReqBody,
+    ResBody,
+    S,
+    Store: SessionStore + Clone,
+    Backend: AuthnBackend + 'static,
+    C: CookieController,
+> Service<Request<ReqBody>> for AuthPicker<S, Backend, Store, C>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Default + Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.bearer.poll_ready(cx)?.is_pending() {
+            return Poll::Pending
+        }
+        self.cookie.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        if let Some(bearer_token_id) = extract_bearer_token(&req, &self.bearer.config) {
+            req.extensions_mut().insert(bearer_token_id);
+            let clone = self.bearer.clone();
+            let mut inner = std::mem::replace(&mut self.bearer, clone);
+            Box::pin(
+                async move {
+                    inner.call(req).await
+                }
+            )
+        } else {
+            let clone = self.cookie.clone();
+            let mut inner = std::mem::replace(&mut self.cookie, clone);
+            Box::pin(
+                async move {
+                    inner.call(req).await
+                }
+            )
         }
     }
 }
