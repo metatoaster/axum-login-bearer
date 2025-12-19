@@ -107,7 +107,7 @@
 //!         .with_session_manager_layer(session_layer)
 //!         // When using session layer, ensure the endpoints that may issue bearer tokens don't have the
 //!         // sessions handled by the `SessionManagerLayer`.
-//!         .with_new_bearer_endpoint("/api/bearer");
+//!         .with_bearer_token_endpoint("/api/bearer");
 //!
 //!     let app = Router::new()
 //!         // ... various `.route(...)` setup
@@ -124,6 +124,8 @@
 //! used.
 
 use std::{
+    borrow::Cow,
+    collections::HashSet,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -164,7 +166,7 @@ enum TokenMode {
 struct BearerTokenAuthManagerConfig {
     expiry: Option<Expiry>,
     data_key: Option<&'static str>,
-    new_bearer_endpoint: Option<&'static str>,
+    bearer_token_endpoints: HashSet<Cow<'static, str>>,
     token_mode: TokenMode,
     has_session_manager_layer: bool,
 }
@@ -230,7 +232,7 @@ impl TokenMode {
 
 impl BearerTokenAuthManagerConfig {
     fn is_bearer_endpoint(&self, uri: &str) -> bool {
-        Some(uri) == self.new_bearer_endpoint
+        self.bearer_token_endpoints.contains(uri)
     }
 }
 
@@ -360,10 +362,14 @@ impl<
         self
     }
 
-    /// Configure the endpoint that will be provided with [`BearerTokenSession`] request extension; typically
+    /// Configure an endpoint that will be provided with [`BearerTokenSession`] request extension; typically
     /// this is useful for endpoints that deal with the issurance of new bearer tokens.
-    pub fn with_new_bearer_endpoint(mut self, new_bearer_endpoint: &'static str) -> Self {
-        self.config.new_bearer_endpoint = Some(new_bearer_endpoint);
+    ///
+    /// If a rather significant number of endpoints are required, setting up the usual `AuthManagerLayer` on
+    /// all other endpoints before assigning the interested endpoints to the route with this without the
+    /// session manager layer configured for an instance of this.
+    pub fn with_bearer_token_endpoint(mut self, bearer_token_endpoint: impl Into<Cow<'static, str>>) -> Self {
+        self.config.bearer_token_endpoints.insert(bearer_token_endpoint.into());
         self
     }
 
