@@ -44,7 +44,7 @@ mod debug {
     use std::fmt::{Debug, Formatter, Result};
     use super::*;
 
-    impl Debug for (dyn BearerTokenIdCodec + Send + Sync + 'static) {
+    impl Debug for dyn BearerTokenIdCodec + Send + Sync + 'static {
         fn fmt(&self, f: &mut Formatter<'_>) -> Result {
             f.debug_struct("BearerTokenIdCodec").finish()
         }
