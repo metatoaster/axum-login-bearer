@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches:
+      - "0.1"
+      - "main"
+      - "testing"
+  pull_request:
+    branches:
+      - "main"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build axum-login-bearer
+      run: cargo build --all-features
+
+    - name: Run tests
+      run: cargo test --all-features

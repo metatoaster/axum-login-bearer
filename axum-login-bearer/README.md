@@ -1,3 +1,7 @@
+[![CI](https://github.com/metatoaster/axum-login-bearer/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/metatoaster/axum-login-bearer/actions/workflows/build.yml?query=branch:main)
+[![crates.io](https://img.shields.io/crates/v/axum-login-bearer//crates.io/crates/axum-login-bearer/)
+[![docs.rs](https://docs.rs/axum-login-bearer/badge.svg)](https://docs.rs/axum-login-bearer/latest/axum-login-bearer/)
+
 # axum-login-bearer
 
 Leverage well-established patterns provided by `axum-login`, but also
