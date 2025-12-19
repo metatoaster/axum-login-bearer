@@ -143,7 +143,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 use tower_sessions::{
     session::Id,
-    service::CookieController,
+    service::{CookieController, PlaintextCookie},
     Expiry, Session, SessionStore, SessionManager, SessionManagerLayer,
 };
 
@@ -331,15 +331,61 @@ where
 
 impl<
     Store: SessionStore,
-    C: CookieController,
     Backend: AuthnBackend,
-> BearerTokenAuthManagerLayer<Store, C, Backend> {
+> BearerTokenAuthManagerLayer<Store, PlaintextCookie, Backend> {
+    /// Construct a new `BearerTokenAuthManagerLayer`.
+    ///
+    /// ```rust
+    /// # use axum_login::{AuthUser, AuthnBackend, UserId};
+    /// # use axum_login_bearer::BearerTokenAuthManagerLayer;
+    /// # use tower_sessions::MemoryStore;
+    /// #
+    /// # #[derive(Clone, Default)]
+    /// # struct Backend;
+    /// #
+    /// # #[derive(Debug, Clone, Default)]
+    /// # struct User;
+    /// #
+    /// # impl AuthUser for User {
+    /// #     type Id = i64;
+    /// #
+    /// #     fn id(&self) -> Self::Id {
+    /// #         0
+    /// #     }
+    /// #
+    /// #     fn session_auth_hash(&self) -> &[u8] {
+    /// #         &[]
+    /// #     }
+    /// # }
+    /// #
+    /// # impl AuthnBackend for Backend {
+    /// #     type User = User;
+    /// #     type Credentials = ();
+    /// #     type Error = std::convert::Infallible;
+    /// #
+    /// #     async fn authenticate(
+    /// #         &self,
+    /// #         _: Self::Credentials,
+    /// #     ) -> Result<Option<Self::User>, Self::Error> {
+    /// #         todo!();
+    /// #     }
+    /// #
+    /// #     async fn get_user(
+    /// #         &self,
+    /// #         user_id: &UserId<Self>,
+    /// #     ) -> Result<Option<Self::User>, Self::Error> {
+    /// #         todo!();
+    /// #     }
+    /// # }
+    /// let backend = Backend::default();
+    /// let session_store = MemoryStore::default();
+    /// let auth_layer = BearerTokenAuthManagerLayer::new(session_store, backend);
+    /// ```
     pub fn new(
         store: Store,
         backend: Backend,
     ) -> Self {
         let config = BearerTokenAuthManagerConfig::default();
-
         Self {
             store: Arc::new(store),
             config,
@@ -347,7 +393,13 @@ impl<
             backend,
         }
     }
+}
 
+impl<
+    Store: SessionStore,
+    C: CookieController,
+    Backend: AuthnBackend,
+> BearerTokenAuthManagerLayer<Store, C, Backend> {
     /// Configure the expiry of the sessions that will be created by this manager.
     pub fn with_expiry(mut self, expiry: Option<Expiry>) -> Self {
         self.config.expiry = expiry;
@@ -377,10 +429,17 @@ impl<
     /// tokens are not in resolved to be usable with the request.
     ///
     /// [`SessionManagerLayer`]: tower_sessions::SessionManagerLayer
-    pub fn with_session_manager_layer(mut self, session_manager_layer: SessionManagerLayer<Store, C>) -> Self {
+    pub fn with_session_manager_layer<C1: CookieController>(
+        mut self,
+        session_manager_layer: SessionManagerLayer<Store, C1>,
+    ) -> BearerTokenAuthManagerLayer<Store, C1, Backend> {
         self.config.has_session_manager_layer = true;
-        self.session_manager_layer = Some(session_manager_layer);
-        self
+        BearerTokenAuthManagerLayer::<Store, C1, Backend> {
+            store: self.store,
+            config: self.config,
+            session_manager_layer: Some(session_manager_layer),
+            backend: self.backend,
+        }
     }
 
     /// Configure a [`BearerTokenIdCodec`] to convert between session id and the bearer tokens that are issued
