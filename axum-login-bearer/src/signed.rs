@@ -44,3 +44,20 @@ impl BearerTokenStrCodec for Signed {
             .ok()
     }
 }
+
+#[cfg(test)]
+mod test {
+    use cookie::Key;
+    use crate::codec::BearerTokenStrCodec;
+    use super::Signed;
+
+    #[test]
+    fn smoke() {
+        let codec = Signed(Key::generate());
+        let s = "abcdefghijkKJIHGFEDCBA";
+        let c = codec.encode(s);
+        assert_ne!(s, c);
+        let d = codec.decode(&c);
+        assert_eq!(d.as_deref(), Some(s));
+    }
+}
