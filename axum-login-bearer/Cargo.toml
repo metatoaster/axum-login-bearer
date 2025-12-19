@@ -37,6 +37,7 @@ serial_test = "3.0.0"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-test = "0.4.3"
 tower = "0.5.2"
+tower-sessions = { version = "0.14.0", features = ["memory-store"] }
 
 [features]
 signed = [
@@ -50,3 +51,7 @@ private = [
     "cookie/secure",
     "rand",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

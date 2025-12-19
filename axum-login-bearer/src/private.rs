@@ -11,6 +11,8 @@ use super::BearerTokenStrCodec;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
+/// This implements [`BearerTokenStrCodec`] in a way that encrypts a session id to a bearer token in a manner
+/// that should be fairly identical to a secure cookie provided by the `cookie` crate.
 pub struct Private {
     // associated data
     aad: String,

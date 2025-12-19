@@ -1,14 +1,142 @@
+//! # Overview
+//!
+//! This crate leverages `tower-sessions` and `axum-login` to provide session identification via a bearer
+//! token as a `tower` middleware for `axum`.
+//!
+//! It offers:
+//!
+//! - **Drop-in replacement of `tower-sessions`**: while taking full advantage of the [`Session`] type that
+//!   packages offers, it can be used without its [`SessionManagerLayer`], but also at the same time can be
+//!   configured to use alongside with it to support both bearer tokens for API type usage and cookie based
+//!   sessions when used with typical browsers.
+//! - **Direct integration with `axum-login`**: taking full advantage of tower's layered design, all the
+//!   existing workflows involving some underlying `Session` can be achieved as this crate simply reuses as
+//!   much of the underlying types as much as possible.
+//!
+//! # Usage
+//!
+//! Roughly speaking, if an existing auth service uses [`AuthManagerLayer`] to provide cookie backed sessions,
+//! to also allow bearer token authorization, simply do the following:
+//!
+//! [`AuthManagerLayer`]: axum_login::AuthManagerLayer
+//! [`Session`]: tower_sessions::Session
+//! [`SessionManagerLayer`]: tower_sessions::SessionManagerLayer
+//!
+//! ```rust,no_run
+//! # use std::collections::HashMap;
+//! #
+//! # use axum_login::{AuthUser, AuthnBackend, UserId};
+//! #
+//! # #[derive(Debug, Clone)]
+//! # struct User {
+//! #     id: i64,
+//! #     pw_hash: Vec<u8>,
+//! # }
+//! #
+//! # impl AuthUser for User {
+//! #     type Id = i64;
+//! #
+//! #     fn id(&self) -> Self::Id {
+//! #         self.id
+//! #     }
+//! #
+//! #     fn session_auth_hash(&self) -> &[u8] {
+//! #         &self.pw_hash
+//! #     }
+//! # }
+//! #
+//! # #[derive(Clone, Default)]
+//! # struct Backend {
+//! #     users: HashMap<i64, User>,
+//! # }
+//! #
+//! # #[derive(Clone)]
+//! # struct Credentials {
+//! #     user_id: i64,
+//! # }
+//! #
+//! # impl AuthnBackend for Backend {
+//! #     type User = User;
+//! #     type Credentials = Credentials;
+//! #     type Error = std::convert::Infallible;
+//! #
+//! #     async fn authenticate(
+//! #         &self,
+//! #         Credentials { user_id }: Self::Credentials,
+//! #     ) -> Result<Option<Self::User>, Self::Error> {
+//! #         Ok(self.users.get(&user_id).cloned())
+//! #     }
+//! #
+//! #     async fn get_user(
+//! #         &self,
+//! #         user_id: &UserId<Self>,
+//! #     ) -> Result<Option<Self::User>, Self::Error> {
+//! #         Ok(self.users.get(user_id).cloned())
+//! #     }
+//! # }
+//! use axum::{
+//!     routing::{get, post},
+//!     Router,
+//! };
+//! use axum_login::{
+//!     login_required,
+//!     tower_sessions::{MemoryStore, SessionManagerLayer},
+//!     AuthManagerLayerBuilder,
+//! };
+//! use axum_login_bearer::BearerTokenAuthManagerLayer;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Session layer.
+//!     let session_store = MemoryStore::default();
+//!     // Note the clone here, the `session_store` will be used later; naturally the bearer tokens may be
+//!     // stored elsewhere to keep them separate, but using different keys with private stores is another
+//!     // differentiate them.
+//!     let session_layer = SessionManagerLayer::new(session_store.clone());
+//!
+//!     // Auth service.
+//!     let backend = Backend::default();
+//!
+//!     // To enable bearer tokens, instead of:
+//!     // let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
+//!
+//!     // ... enable the use of BearerTokenAuthManager:
+//!     let auth_layer = BearerTokenAuthManagerLayer::new(session_store, backend)
+//!         // Use this to also allow the use of cookies like with the typical setup, which will allow the
+//!         // other path to pass the session to the `AuthManager`.
+//!         .with_session_manager_layer(session_layer)
+//!         // When using session layer, ensure the endpoints that may issue bearer tokens don't have the
+//!         // sessions handled by the `SessionManagerLayer`.
+//!         .with_new_bearer_endpoint("/api/bearer");
+//!
+//!     let app = Router::new()
+//!         // ... various `.route(...)` setup
+//!         .layer(auth_layer);
+//!
+//!     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+//!     axum::serve(listener, app.into_make_service()).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Do refer to examples for reference usage, as this is just a rough description of how this might be
+//! used.
+
 use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use axum::http::{header, Request, Response};
+use axum::{
+    extract::FromRequestParts,
+    http::{request::Parts, header, Request, Response, StatusCode},
+};
 use axum_login::{AuthManager, AuthnBackend};
+#[cfg(any(feature = "signed", feature = "private"))]
+use cookie::Key;
 use tower::util::Either;
 use tower_cookies::CookieManager;
-#[cfg(any(feature = "signed", feature = "private"))]
-use tower_cookies::Key;
 use tower_layer::Layer;
 use tower_service::Service;
 use tower_sessions::{
@@ -41,12 +169,19 @@ struct BearerTokenAuthManagerConfig {
     has_session_manager_layer: bool,
 }
 
+/// A thin wrapper around the underlying [`Session`] to provide a helper to encode the token; [`AuthSession`]
+/// should still be used for the more extensive features that it offers for the identification,
+/// authentication and authorization of users.
+///
+/// [`Session`]: tower_sessions::Session
+/// [`AuthSession`]: axum_login::AuthSession
 #[derive(Clone, Debug)]
-pub struct BearerAuthSession {
+pub struct BearerTokenSession {
     session: Session,
     token_mode: TokenMode,
 }
 
+/// A middleware that provides [`BearerTokenSession`] as a request extension.
 #[derive(Clone)]
 pub struct BearerTokenAuthManager<S, Store> {
     inner: S,
@@ -54,6 +189,7 @@ pub struct BearerTokenAuthManager<S, Store> {
     config: BearerTokenAuthManagerConfig,
 }
 
+/// A middleware that provides [`BearerTokenSession`] as a request extension.
 #[derive(Debug, Clone)]
 pub struct BearerTokenAuthManagerLayer<
     Store: SessionStore,
@@ -98,16 +234,37 @@ impl BearerTokenAuthManagerConfig {
     }
 }
 
-impl BearerAuthSession {
+impl BearerTokenSession {
     fn new(session: Session, token_mode: TokenMode) -> Self {
-        BearerAuthSession { session, token_mode }
+        BearerTokenSession { session, token_mode }
     }
 
-    /// Encode the underlying session into a bearer token that may be sent to the client.
+    /// Encode the underlying session's id into a bearer token that may be sent to the client.
     pub fn encode_token(&self) -> Option<String> {
         self.session.id()
             .as_ref()
             .map(|id| self.token_mode.encode_id(id))
+    }
+
+    /// Saves the underlying session to the store; see [`Session::save`].
+    ///
+    /// [`Session::save`]: tower_sessions::Session::save
+    pub async fn save(&self) -> Result<(), tower_sessions::session::Error> {
+        self.session.save().await
+    }
+}
+
+impl<S> FromRequestParts<S> for BearerTokenSession
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<BearerTokenSession>().cloned().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Can't extract `BearerTokenSession`. Is `BearerTokenAuthManagerLayer` enabled for this endpoint?",
+        ))
     }
 }
 
@@ -151,7 +308,7 @@ where
         // must provide the token to extensions as there may be no other layers below this.
         let id = bearer_token_id.0;
         let session = Session::new(id, self.store.clone(), self.config.clone().expiry);
-        let token = BearerAuthSession::new(session.clone(), self.config.token_mode.clone());
+        let token = BearerTokenSession::new(session.clone(), self.config.token_mode.clone());
         req.extensions_mut().insert(session);
         req.extensions_mut().insert(token);
 
@@ -189,41 +346,55 @@ impl<
         }
     }
 
+    /// Configure the expiry of the sessions that will be created by this manager.
     pub fn with_expiry(mut self, expiry: Option<Expiry>) -> Self {
         self.config.expiry = expiry;
         self
     }
 
+    /// Configure the `data_key` that will be passed to the underlying [`AuthManager`].
+    ///
+    /// [`AuthManager`]: axum_login::AuthManager
     pub fn with_data_key(mut self, data_key: &'static str) -> Self {
         self.config.data_key = Some(data_key);
         self
     }
 
+    /// Configure the endpoint that will be provided with [`BearerTokenSession`] request extension; typically
+    /// this is useful for endpoints that deal with the issurance of new bearer tokens.
     pub fn with_new_bearer_endpoint(mut self, new_bearer_endpoint: &'static str) -> Self {
         self.config.new_bearer_endpoint = Some(new_bearer_endpoint);
         self
     }
 
-    /// Configure this `BearerTokenManagerLayer` with a `SessionManagerLayer` to enable
-    /// fallback with cookie-based sessions when Bearer tokens are not available.
+    /// Configure with a [`SessionManagerLayer`] to enable fallback with cookie-based sessions when bearer
+    /// tokens are not in resolved to be usable with the request.
+    ///
+    /// [`SessionManagerLayer`]: tower_sessions::SessionManagerLayer
     pub fn with_session_manager_layer(mut self, session_manager_layer: SessionManagerLayer<Store, C>) -> Self {
         self.config.has_session_manager_layer = true;
         self.session_manager_layer = Some(session_manager_layer);
         self
     }
 
+    /// Configure a [`BearerTokenIdCodec`] to convert between session id and the bearer tokens that are issued
+    /// to the users.
     pub fn with_token_id_codec(mut self, codec: impl BearerTokenIdCodec + Send + Sync + 'static) -> Self {
         self.config.token_mode = TokenMode::Custom(Arc::new(codec));
         self
     }
 
     #[cfg(feature = "signed")]
+    /// Configure a [`BearerTokenIdCodec`] that will sign the session id to make a bearer token, much like
+    /// signed cookies from the `cookies` crate.
     pub fn with_signed(mut self, key: Key) -> Self {
         self.config.token_mode = TokenMode::Custom(Arc::new(signed::Signed(key)));
         self
     }
 
     #[cfg(feature = "private")]
+    /// Configure a [`BearerTokenIdCodec`] that will encrypt the session id to make a bearer token, much like
+    /// encrypted cookies from the `cookies` crate.
     pub fn with_private(mut self, key: Key) -> Self {
         // using "id" as that's the default for the cookie.
         // shouldn't matter if the key is different to the one that's ultimately assigned to the cookie
@@ -281,7 +452,7 @@ for
 #[derive(Clone, Debug)]
 struct BearerTokenId(Option<Id>);
 
-// Selecting different layers is normally the ideal use case for `Steer, but unfortunately it does not work
+// Selecting different layers is normally the ideal use case for `Steer`, but unfortunately it does not work
 // in our case here due to type bounds being specified with a `Request` due to the `Picker` showing up as
 // part of the type signature, which renders it being incompatible when being applied to a `Router`.  For
 // example, this was tried:
@@ -303,11 +474,13 @@ struct BearerTokenId(Option<Id>);
 //
 // While there weren't any issues with compiling, but upon usage with a `Router`:
 //
+// ```
 // error[E0277]: `dyn HttpBody<Data = Bytes, Error = Error> + Send` cannot be shared between threads safely
 //    --> examples/sqlite-bearer/src/web/app.rs:71:20
 //     |
 // 71  |             .layer(auth_layer);
 //     |              ----- ^^^^^^^^^^ `dyn HttpBody<Data = Bytes, Error = Error> + Send` cannot be shared between threads safely
+// ```
 //
 // That's due to the need to have the underlying Request type exposed at the layer level, even though that
 // normally doesn't come into play until later.
@@ -316,8 +489,18 @@ struct BearerTokenId(Option<Id>);
 // a custom struct with only the immediately neede things laid out given the relative simplicity of only
 // having two stacks to pick from.
 
-/// This provides a service that discriminates between auth sessions tracked by cookie backed and bearer token
-/// backed sessions.
+/// A layer for steering an incoming request, depending on its contents, to the desired layer that tracks a
+/// session, either using a cookie or a bearer token.
+///
+/// This is set up by the [`BearerTokenAuthManagerLayer`] if a [`SessionManagerLayer`] is configured with it.
+/// The heuristics for determining which stack to use is it will first check the request for an authorization
+/// header and whether or not its authentication scheme is `Bearer`.  Should no authorization header be found
+/// then it checks whether or not if the incoming uri points to a bearer endpoint.  If either conditions are
+/// true the [`BearerTokenAuthManager`] will be used to, otherwise the [`SessionManager`] will be used
+/// instead.
+///
+/// [`SessionManagerLayer`]: tower_sessions::SessionManagerLayer
+/// [`SessionManager`]: tower_sessions::SessionManager
 #[derive(Clone)]
 pub struct AuthPicker<S, Backend: AuthnBackend, Store: SessionStore, C: CookieController> {
     bearer: BearerTokenAuthManager<AuthManager<S, Backend>, Store>,

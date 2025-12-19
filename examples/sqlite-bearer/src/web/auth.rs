@@ -8,8 +8,7 @@ use axum::{
 };
 use axum_messages::{Message, Messages};
 use serde::Deserialize;
-use tower_sessions::Session;
-use axum_login_bearer::BearerAuthSession;
+use axum_login_bearer::BearerTokenSession;
 
 use crate::users::{AuthSession, Credentials};
 
@@ -73,8 +72,7 @@ mod post {
     }
 
     pub async fn bearer(
-        session: axum::Extension<Session>,
-        bearer_auth_session: axum::Extension<BearerAuthSession>,
+        session: BearerTokenSession,
         mut auth_session: AuthSession,
         messages: Messages,
         Form(creds): Form<Credentials>,
@@ -94,7 +92,7 @@ mod post {
         if session.save().await.is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        if let Some(token) = bearer_auth_session.encode_token() {
+        if let Some(token) = session.encode_token() {
             token.into_response()
         } else {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

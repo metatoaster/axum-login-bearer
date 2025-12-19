@@ -7,6 +7,8 @@ use super::BearerTokenStrCodec;
 
 const BASE64_DIGEST_LEN: usize = 44;
 
+/// This implements [`BearerTokenStrCodec`] in a way that builds a bearer token by signing the session id
+/// using a `Key`.  The implementation is identical to a signed cookie provided by the `cookie` crate.
 pub struct Signed(pub Key);
 
 impl BearerTokenStrCodec for Signed {
